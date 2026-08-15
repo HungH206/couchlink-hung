@@ -11,6 +11,13 @@ import {
 import { ControllerViz, useLivePads } from "./ControllerViz";
 import { clog, cerror, cwarn } from "./log";
 import { usePlayerCallbacks } from "./usePlayerCallbacks";
+import DebugDrawer, { type PresentSummary } from "./DebugDrawer";
+import { KeyboardMouseInput } from "./keyboardMouse";
+import { detectMobile } from "./mobile";
+import { TouchGamepadInput } from "./touchPad";
+import { TouchOverlay } from "./TouchOverlay";
+import type { PlayerTelemetry } from "./player";
+import { parseInviteString } from "./invite";
 import "./App.css";
 
 const DEFAULT_WS =
@@ -50,6 +57,9 @@ export default function App() {
   const [signalingUrl, setSignalingUrl] = useState(invite.signalingUrl ?? DEFAULT_WS);
   const [sessionId, setSessionId] = useState(invite.sessionId);
   const [pin, setPin] = useState(invite.pin);
+  const [pasteLink, setPasteLink] = useState("");
+  const [pasteError, setPasteError] = useState<string | null>(null);
+  const [pastedTurn, setPastedTurn] = useState(invite.turn);
   const [state, setState] = useState<ConnectionState>("disconnected");
   const [detail, setDetail] = useState("");
   const [streamMeta, setStreamMeta] = useState("—");
@@ -58,14 +68,46 @@ export default function App() {
   const [fullscreen, setFullscreen] = useState(false);
   const [presentMode, setPresentMode] = useState<"webcodecs" | "canvas" | "video" | "—">("—");
   const [ctxHint, setCtxHint] = useState<string | null>(() => secureContextHint());
+  const [telemetry, setTelemetry] = useState<PlayerTelemetry | null>(null);
+  const [hostStats, setHostStats] = useState<{
+    fps: number;
+    frames_out: number;
+    dropped_frames: number;
+    drop_pct: number;
+    capture_ms: number;
+    scale_ms: number;
+    encode_ms: number;
+    push_ms: number;
+    dominant_stage: string;
+    target_width: number;
+    target_height: number;
+    target_fps: number;
+    target_bitrate_kbps: number;
+  } | null>(null);
+  const [present, setPresent] = useState<PresentSummary | null>(null);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [kbmActive, setKbmActive] = useState(false);
+  const [pointerLocked, setPointerLocked] = useState(false);
+  const kbmRef = useRef<KeyboardMouseInput | null>(null);
+  const [isMobile, setIsMobile] = useState(() => detectMobile());
+  const touchInputRef = useRef<TouchGamepadInput | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  /** Canvas the WebCodecs path paints to, kept separate from the RTP canvas so
+   * RTP can stay on screen as a safety net while WebCodecs warms up. */
+  const wcCanvasRef = useRef<HTMLCanvasElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
+  /** Fullscreen target on mobile — wraps the stage + touch controller so both
+   * are visible (controller overlays the video) in fullscreen. Desktop keeps
+   * fullscreening the stage element exactly as before. */
+  const mobileFsRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<CouchlinkPlayer | null>(null);
   const viewRef = useRef<LowLatencyCanvasView | null>(null);
   const wcRef = useRef<WebCodecsCanvasView | null>(null);
   const webcodecsActiveRef = useRef(false);
+  /** WebCodecs has painted and owns the visible canvas (RTP no longer on screen). */
+  const promotedRef = useRef(false);
   const rtpFallbackTimer = useRef<number | null>(null);
   const autoStarted = useRef(false);
   const pendingStreamRef = useRef<MediaStream | null>(null);
@@ -89,57 +131,79 @@ export default function App() {
     }
   }
 
-  /** If WebCodecs never paints, fall back to the RTP media track. */
+  /** If WebCodecs never paints, fall back to the RTP media track.
+   *
+   * RTP has been painting the whole warm-up, so the fallback just hides the
+   * empty WebCodecs canvas and keeps the RTP canvas — no re-attach needed. */
   function armWebCodecsFallback() {
     clearRtpFallbackTimer();
     rtpFallbackTimer.current = window.setTimeout(() => {
       rtpFallbackTimer.current = null;
       if (!webcodecsActiveRef.current) return;
       if (wcRef.current?.hasPainted()) return;
-      const stream = heldStreamRef.current;
       cwarn("WebCodecs produced no frames — falling back to RTP canvas");
       webcodecsActiveRef.current = false;
+      promotedRef.current = false;
       playerRef.current?.preferRtpPresent();
       wcRef.current?.stop();
+      wcCanvasRef.current?.classList.add("is-hidden");
+      canvasRef.current?.classList.remove("is-hidden");
       setVideoDiag("webcodecs: no frames — RTP fallback");
-      if (stream) attachStream(stream);
     }, 2500);
   }
 
   function ensureWebCodecs(): boolean {
-    if (preferLegacyVideo() || !canUseWebCodecs() || !canvasRef.current) return false;
+    if (preferLegacyVideo() || !canUseWebCodecs() || !wcCanvasRef.current) return false;
     if (!wcRef.current) {
-      wcRef.current = new WebCodecsCanvasView(canvasRef.current);
+      wcRef.current = new WebCodecsCanvasView(wcCanvasRef.current);
       wcRef.current.setStatsHandler((s) => {
         clearRtpFallbackTimer();
         setVideoDiag(
           `webcodecs: ${s.width}×${s.height} @ ${s.presentFps}fps drop=${s.dropped} dec=${s.decodeMs.toFixed(1)}ms`
         );
         setPresentMode("webcodecs");
+        setPresent({ fps: s.presentFps, dropped: s.dropped, width: s.width, height: s.height });
       });
       wcRef.current.setKeyframeHandler(() => {
         playerRef.current?.requestVideoKeyframe();
+      });
+      // Hand the visible canvas over to WebCodecs only once it has actually
+      // painted — until then RTP stays on screen as the safety net.
+      wcRef.current.setFirstPaintHandler(() => {
+        promoteWebcodecsPresent();
       });
     }
     // Don't tear down a live decoder on every callback.
     if (!wcRef.current.isRunning() && !wcRef.current.start()) return false;
     webcodecsActiveRef.current = true;
+    clog("webcodecs decoder warming — RTP stays live until first paint");
+    armWebCodecsFallback();
+    return true;
+  }
+
+  /** WebCodecs painted its first frame — take over the canvas and cut RTP. */
+  function promoteWebcodecsPresent() {
+    if (promotedRef.current) return;
+    promotedRef.current = true;
+    clearRtpFallbackTimer();
     viewRef.current?.stop();
     if (videoRef.current) {
       videoRef.current.srcObject = null;
       videoRef.current.classList.add("is-hidden");
     }
-    canvasRef.current.classList.remove("is-hidden");
+    canvasRef.current?.classList.add("is-hidden");
+    wcCanvasRef.current?.classList.remove("is-hidden");
     setPresentMode("webcodecs");
-    clog("present mode: WebCodecs + CLVD");
-    armWebCodecsFallback();
-    return true;
+    clog("present mode: WebCodecs + CLVD (promoted after first paint)");
+    playerRef.current?.promoteWebcodecs();
   }
 
   function attachStream(stream: MediaStream) {
     heldStreamRef.current = stream;
-    // WebCodecs path owns the canvas — keep the RTP stream for fallback only.
-    if (webcodecsActiveRef.current) {
+    // WebCodecs owns the canvas once promoted — keep the RTP stream for
+    // fallback only. During warm-up it is NOT promoted, so RTP keeps painting
+    // as the visible safety net while the WebCodecs decoder warms up.
+    if (promotedRef.current) {
       if (heldLoggedRef.current !== stream) {
         heldLoggedRef.current = stream;
         clog("RTP stream held for fallback — WebCodecs present active");
@@ -147,7 +211,11 @@ export default function App() {
       return;
     }
     clearRtpFallbackTimer();
-    wcRef.current?.stop();
+    // Don't tear down a warming WebCodecs decoder — this is the safety-net
+    // RTP delivery, not a switch away from an active WebCodecs present.
+    if (!webcodecsActiveRef.current) {
+      wcRef.current?.stop();
+    }
     const track = stream.getVideoTracks()[0];
     const wantCanvas =
       !preferLegacyVideo() && !!track && canUseLowLatencyCanvas() && !!canvasRef.current;
@@ -160,6 +228,7 @@ export default function App() {
             `canvas: ${s.width}×${s.height} @ ${s.presentFps}fps drop=${s.dropped}`
           );
           setPresentMode("canvas");
+          setPresent({ fps: s.presentFps, dropped: s.dropped, width: s.width, height: s.height });
         });
       }
       void viewRef.current.start(track).then((ok) => {
@@ -276,6 +345,8 @@ export default function App() {
         viewRef.current?.stop();
         wcRef.current?.stop();
         webcodecsActiveRef.current = false;
+        promotedRef.current = false;
+        setPresent(null);
       }
     },
     onVideo: (stream) => attachStream(stream),
@@ -308,6 +379,8 @@ export default function App() {
     onPadStats: (hz, name) => {
       setPadMeta(`${hz} Hz · ${name}`);
     },
+    onTelemetry: (t) => setTelemetry(t),
+    onHostStats: (s) => setHostStats(s),
   });
 
   useEffect(() => {
@@ -319,6 +392,7 @@ export default function App() {
       viewRef.current?.stop();
       wcRef.current?.stop();
       webcodecsActiveRef.current = false;
+      promotedRef.current = false;
       player.disconnect();
     };
     window.addEventListener("pagehide", onPageHide);
@@ -328,6 +402,7 @@ export default function App() {
       viewRef.current?.stop();
       wcRef.current?.stop();
       webcodecsActiveRef.current = false;
+      promotedRef.current = false;
     };
     // playerCallbacks identity is stable for the lifetime of the tab
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional singleton player
@@ -341,11 +416,77 @@ export default function App() {
     playerRef.current?.connect(signalingUrl, invite.sessionId, invite.pin);
   }, [invite.auto, invite.sessionId, invite.pin, signalingUrl]);
 
+  // Create/destroy keyboard+mouse input and wire it into the player
+  useEffect(() => {
+    const canvas = canvasRef.current ?? stageRef.current ?? undefined;
+    if (kbmActive) {
+      const kbm = new KeyboardMouseInput({ lockTarget: canvas ?? null });
+      kbmRef.current = kbm;
+      kbm.start();
+      playerRef.current?.setKbm(kbm);
+      const onLockChange = () => setPointerLocked(!!document.pointerLockElement);
+      document.addEventListener("pointerlockchange", onLockChange);
+      return () => {
+        kbm.stop();
+        kbmRef.current = null;
+        playerRef.current?.setKbm(null);
+        document.removeEventListener("pointerlockchange", onLockChange);
+        setPointerLocked(false);
+      };
+    } else {
+      kbmRef.current?.stop();
+      kbmRef.current = null;
+      playerRef.current?.setKbm(null);
+    }
+  }, [kbmActive]);
+
+  // Re-detect mobile on resize/orientation so the layout follows the device.
+  useEffect(() => {
+    const onResize = () => setIsMobile(detectMobile());
+    window.addEventListener("resize", onResize);
+    window.addEventListener("orientationchange", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("orientationchange", onResize);
+    };
+  }, []);
+
+  // Touch controller: one shared input for the mobile layout, live for the
+  // lifetime of the page. Desktop is unaffected — setTouchInput(null) when the
+  // device is not mobile, and the overlay is only rendered on mobile.
+  useEffect(() => {
+    const input = new TouchGamepadInput();
+    touchInputRef.current = input;
+    if (isMobile) {
+      playerRef.current?.setTouchInput(input);
+    } else {
+      playerRef.current?.setTouchInput(null);
+    }
+    return () => {
+      input.detach();
+      touchInputRef.current = null;
+      playerRef.current?.setTouchInput(null);
+    };
+  }, [isMobile]);
+
   const connected = state === "connected" || state === "negotiating";
   const livePads = useLivePads(true);
 
+  const applyPastedLink = () => {
+    try {
+      const parsed = parseInviteString(pasteLink);
+      setSessionId(parsed.sessionId);
+      setPin(parsed.pin);
+      if (parsed.signalingUrl) setSignalingUrl(parsed.signalingUrl);
+      setPastedTurn(parsed.turn);
+      setPasteError(null);
+    } catch (e) {
+      setPasteError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   return (
-    <div className={`shell ${fullscreen ? "is-fullscreen" : ""}`}>
+    <div className={`shell ${fullscreen ? "is-fullscreen" : ""} ${isMobile ? "is-mobile" : ""}`}>
       <header className="top">
         <div className="brand">
           <img className="brand-logo" src="/logo.png" alt="" width={56} height={56} />
@@ -359,6 +500,27 @@ export default function App() {
 
       {!connected && (
         <section className="join">
+          <label>
+            Join link
+            <input
+              value={pasteLink}
+              onChange={(e) => {
+                setPasteLink(e.target.value);
+                if (pasteError) setPasteError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") applyPastedLink();
+              }}
+              placeholder="paste the link your host sent — or session:pin"
+              spellCheck={false}
+            />
+          </label>
+          <div className="actions">
+            <button type="button" onClick={applyPastedLink}>
+              Fill in from link
+            </button>
+          </div>
+          {pasteError && <p className="error">{pasteError}</p>}
           <label>
             Signaling
             <input
@@ -390,7 +552,7 @@ export default function App() {
               type="button"
               className="primary"
               onClick={() => {
-                playerRef.current?.setTurn(invite.turn);
+                playerRef.current?.setTurn(pastedTurn);
                 playerRef.current?.connect(signalingUrl, sessionId, pin);
               }}
             >
@@ -419,27 +581,43 @@ export default function App() {
       )}
 
       <div className="broadcast">
-        <div className="stage-wrap" ref={stageRef}>
-          <canvas ref={canvasRef} className="stage is-hidden" aria-label="Game stream" />
-          <video ref={videoRef} className="stage" playsInline muted autoPlay />
-          {state !== "connected" && (
-            <div className="overlay">
-              <span>{detail || "Waiting for video…"}</span>
-            </div>
-          )}
-          {state === "connected" && videoDiag.includes("?×?") && (
-            <div className="overlay overlay-dim">
-              <span>{detail || "Connected — waiting for first video frame…"}</span>
-            </div>
-          )}
-          {state === "connected" && captureHint && (
-            <div className="overlay overlay-dim">
-              <span>{captureHint}</span>
+        <div
+          className={`mobile-game${isMobile ? " is-mobile" : ""}${fullscreen ? " is-fullscreen" : ""}`}
+          ref={mobileFsRef}
+        >
+          <div className="stage-wrap" ref={stageRef}>
+            <canvas ref={canvasRef} className="stage is-hidden" aria-label="Game stream (RTP)" />
+            <canvas
+              ref={wcCanvasRef}
+              className="stage is-hidden"
+              aria-label="Game stream (WebCodecs)"
+            />
+            <video ref={videoRef} className="stage" playsInline muted autoPlay />
+            {state !== "connected" && (
+              <div className="overlay">
+                <span>{detail || "Waiting for video…"}</span>
+              </div>
+            )}
+            {state === "connected" && videoDiag.includes("?×?") && (
+              <div className="overlay overlay-dim">
+                <span>{detail || "Connected — waiting for first video frame…"}</span>
+              </div>
+            )}
+            {state === "connected" && captureHint && (
+              <div className="overlay overlay-dim">
+                <span>{captureHint}</span>
+              </div>
+            )}
+          </div>
+
+          {isMobile && connected && touchInputRef.current && (
+            <div className="touch-dock">
+              <TouchOverlay input={touchInputRef.current} />
             </div>
           )}
         </div>
 
-        {livePads.length > 0 && (
+        {!isMobile && livePads.length > 0 && (
           <section className="pads" aria-live="polite">
             <div className="pads-head">
               <span className="pads-count">
@@ -458,14 +636,40 @@ export default function App() {
             </div>
           </section>
         )}
-        {connected && livePads.length === 0 && (
+        {connected && !isMobile && livePads.length === 0 && (
           <section className="pads" aria-live="polite">
             <p className="pads-empty">
               Pair a pad, then press any button so the browser unlocks it.
             </p>
+            <div className="kbm-row">
+              <button
+                type="button"
+                className={`kbm-toggle ${kbmActive ? "is-active" : ""}`}
+                onClick={() => setKbmActive((v) => !v)}
+              >
+                {kbmActive ? "⌨ keyboard+mouse ON" : "⌨ use keyboard+mouse"}
+              </button>
+              {kbmActive && (
+                <span className="kbm-hint">
+                  {pointerLocked
+                    ? "🔒 mouse locked — Esc to release"
+                    : "click stream to lock mouse · WASD=move · LMB=R2 · RMB=L2 · Space=✕ · E=△ · Q=□ · F=○"}
+                </span>
+              )}
+            </div>
           </section>
         )}
       </div>
+
+      <DebugDrawer
+        telemetry={telemetry}
+        hostStats={hostStats}
+        present={present}
+        streamInfo={streamMeta}
+        presentMode={presentMode}
+        open={debugOpen}
+        onToggle={() => setDebugOpen((o) => !o)}
+      />
 
       <footer className="meta">
         <span>{streamMeta}</span>
@@ -476,7 +680,10 @@ export default function App() {
           type="button"
           className="ghost"
           onClick={() => {
-            const el = stageRef.current;
+            // On mobile the fullscreen target wraps stage + touch controller so
+            // the controller overlays the video at low opacity; desktop keeps
+            // fullscreening the stage element as before.
+            const el = isMobile ? mobileFsRef.current : stageRef.current;
             if (!document.fullscreenElement && el) {
               void el.requestFullscreen();
               setFullscreen(true);

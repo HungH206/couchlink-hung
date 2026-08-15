@@ -36,6 +36,11 @@ export type SignalMessage =
    * the virtual device and emulator binding. The Gamepad API normalises input,
    * so the host cannot tell an Xbox pad from a DualSense without being told. */
   | { type: "pad_info"; kind: string; id: string }
+  /** Player → host: which video path it is actually presenting from, so the
+   * host can stop writing the path nobody is painting from. "warmup" means
+   * WebCodecs is starting on the DataChannel — keep both paths live as a
+   * safety net until it paints, then it reports "webcodecs". */
+  | { type: "present_path"; path: "webcodecs" | "rtp" | "warmup" }
   | {
       type: "stream_info";
       width: number;
@@ -44,6 +49,22 @@ export type SignalMessage =
       codec: string;
       capture_ok?: boolean;
       capture_hint?: string;
+    }
+  | {
+      type: "host_stats";
+      fps: number;
+      frames_out: number;
+      dropped_frames: number;
+      drop_pct: number;
+      capture_ms: number;
+      scale_ms: number;
+      encode_ms: number;
+      push_ms: number;
+      dominant_stage: string;
+      target_width: number;
+      target_height: number;
+      target_fps: number;
+      target_bitrate_kbps: number;
     };
 
 export function send(ws: WebSocket, msg: SignalMessage) {

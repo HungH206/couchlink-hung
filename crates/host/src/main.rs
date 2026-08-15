@@ -4,6 +4,7 @@ mod emulator_pad;
 mod encode;
 mod invite;
 mod latency;
+mod link_gov;
 mod motion;
 mod scale;
 mod signaling_client;
@@ -29,6 +30,20 @@ const IDR_INTERVAL: Duration = Duration::from_secs(2);
 /// frame is already too old to be worth showing.
 const PUSH_BUDGET: Duration = Duration::from_millis(50);
 
+/// Longest a *keyframe* push may hold the loop.
+///
+/// A keyframe is the only thing that lets a viewer who joined mid-GOP start
+/// painting — the browser's WebCodecs path literally refuses to configure its
+/// decoder until an IDR arrives. On a fresh SCTP DataChannel the send is in
+/// slow-start, so the very first keyframe is also the most likely to blow the
+/// normal 50ms budget. Drop it and the viewer waits for the next scheduled
+/// IDR (up to `IDR_INTERVAL` away) — and if the channel is still ramping that
+/// one goes too, the browser's fallback timer fires, and the session settles
+/// on RTP with its jitter buffer for its entire duration. Keyframes are rare
+/// (at most one per `IDR_INTERVAL`), so a generous budget costs nothing in
+/// steady state while making the join reliable.
+const KEYFRAME_PUSH_BUDGET: Duration = Duration::from_secs(1);
+
 /// Push one frame, but never let it park the caller.
 ///
 /// `push_h264` awaits twice — the SCTP DataChannel and the RTP sample writer —
@@ -41,21 +56,58 @@ const PUSH_BUDGET: Duration = Duration::from_millis(50);
 /// Guarding the individual awaits is whack-a-mole — the invariant is that
 /// nothing here may block indefinitely, so the budget is enforced at the edge
 /// and covers any await added inside later.
+/// `Ok(true)` means the frame was dropped (budget timeout, or shed by SCTP
+/// congestion in `push_h264`), not sent.
+///
+/// The caller must not count a dropped frame as delivered — this used to
+/// return `Ok(())` on both a real send and a timeout indistinguishably, so
+/// the periodic fps/stage diagnostics silently over-counted during exactly
+/// the congestion they exist to reveal. The same blind spot also shed
+/// congestion-stalled frames as "sent", so the link governor never stepped
+/// the encoder down on a saturated path.
 async fn push_bounded(
     host: &webrtc_peer::WebRtcHost,
     nal: Vec<u8>,
     dur: Duration,
     keyframe: bool,
-) -> Result<()> {
-    match tokio::time::timeout(PUSH_BUDGET, host.push_h264(nal, dur, keyframe)).await {
-        Ok(r) => r,
+) -> Result<bool> {
+    match tokio::time::timeout(
+        if keyframe { KEYFRAME_PUSH_BUDGET } else { PUSH_BUDGET },
+        host.push_h264(nal, dur, keyframe),
+    )
+    .await
+    {
+        Ok(Ok(shed)) => Ok(shed),
+        Ok(Err(e)) => Err(e),
         Err(_) => {
             // Dropped H.264 leaves the decoder referencing frames it never got.
             host.request_keyframe();
-            warn!("frame push exceeded {PUSH_BUDGET:?} — dropped, asked for a keyframe");
-            Ok(())
+            warn!("frame push exceeded budget — dropped, asked for a keyframe");
+            Ok(true)
         }
     }
+}
+
+/// One stage's share of a frame's total processing time, for naming the
+/// current bottleneck rather than leaving the reader to eyeball four numbers.
+fn dominant_stage(stages: &[(&str, Duration)]) -> &'static str {
+    stages
+        .iter()
+        .max_by_key(|(_, d)| *d)
+        .map(|(name, _)| match *name {
+            "capture" => "capture (Windows→WSL handoff)",
+            "scale" => "scale (BGRA resize)",
+            "encode" => "encode (H.264)",
+            "push" => "push (network send)",
+            other => {
+                // New stage names must be taught here explicitly rather than
+                // silently falling through to a placeholder — a bottleneck
+                // label that doesn't say what it means is worse than none.
+                debug_assert!(false, "dominant_stage: unlabelled stage {other:?}");
+                "unknown"
+            }
+        })
+        .unwrap_or("none")
 }
 
 
@@ -121,6 +173,26 @@ async fn main() -> Result<()> {
         }),
         _ => None,
     };
+    // Ship the friend's WireGuard config inside the link when one exists, so a
+    // direct tunnel needs no out-of-band file transfer. Opt out with
+    // COUCHLINK_INVITE_WG=0 — the config is credential-bearing, and a host that
+    // pastes join links into a group chat may not want it embedded.
+    let wg_conf = if std::env::var("COUCHLINK_INVITE_WG").as_deref() == Ok("0") {
+        None
+    } else {
+        std::env::var("COUCHLINK_ROOT")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|e| e.parent()?.parent()?.parent().map(|p| p.to_path_buf()))
+            })
+            .map(|root| root.join("infra/wireguard/wg0-player.conf"))
+            .filter(|p| p.is_file())
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .filter(|c| c.contains("[Peer]") && c.contains("Endpoint"))
+    };
     let join = invite::player_invite_url(
         &public_http,
         &args.session_id,
@@ -129,6 +201,7 @@ async fn main() -> Result<()> {
         turn,
         mesh.as_deref(),
         headscale,
+        wg_conf.as_deref(),
     );
     // Always surface the invite — this is what the friend needs.
     println!("friend join URL:\n{join}");
@@ -230,6 +303,29 @@ async fn main() -> Result<()> {
             "local display"
         }
     );
+    // Command the Windows encoder to match the preset so the wire size, rate and
+    // bitrate can never silently diverge from what the host advertises. Without
+    // this a directly-launched host and a stale win-capture stream e.g. 1728x1080
+    // while the player is told 1280x720 — overloading both the link and a remote
+    // decoder that cannot shrink the stream in time.
+    capturer.set_target(couchlink_capture_bridge::EncodeTarget {
+        width: preset.width,
+        height: preset.height,
+        fps: preset.fps,
+        bitrate_kbps: preset.bitrate_kbps,
+    });
+    // Close the loop between the link and the Windows encoder: when the push
+    // shows persistent sheds, work the commanded target down the rung ladder so
+    // the player's decoder stays fed instead of burning keyframe requests on a
+    // stream it cannot drain. Only the pre-encoded path feeds it (the local
+    // encoder is in-process and already preset-bound).
+    let mut link_gov = link_gov::LinkGov::new(couchlink_capture_bridge::EncodeTarget {
+        width: preset.width,
+        height: preset.height,
+        fps: preset.fps,
+        bitrate_kbps: preset.bitrate_kbps,
+    });
+    let mut commanded_target = link_gov.current();
     let mut encoder = encode::H264Encoder::new(preset.width, preset.height, preset.bitrate_kbps)?;
     let mut motion = motion::MotionDetector::new(preset.width, preset.height);
     // Motion is measured on the raw capture, whose size is not the preset size.
@@ -241,6 +337,9 @@ async fn main() -> Result<()> {
     let mut rate_window = std::time::Instant::now();
     let mut rate_mark: u64 = 0;
     let mut idle_frames: u64 = 0;
+    // Frames the PUSH_BUDGET timeout dropped in the current window — the
+    // direct, on-host signal that the peer (or the link to it) can't keep up.
+    let mut dropped_frames: u64 = 0;
     let (mut stage_capture, mut stage_scale, mut stage_encode, mut stage_push) =
         (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let mut force_idr = true;
@@ -449,6 +548,9 @@ async fn main() -> Result<()> {
                             });
                         }
                     }
+                    Some(SignalMessage::PresentPath { path }) => {
+                        host.set_present_path(&path);
+                    }
                     Some(SignalMessage::Heartbeat) => {
                         let _ = signal_out.send(SignalMessage::Pong);
                     }
@@ -507,25 +609,69 @@ async fn main() -> Result<()> {
                         if keyframe {
                             last_idr = std::time::Instant::now();
                         }
-                        if let Err(e) = push_bounded(&host, nal, per_frame, keyframe).await {
-                            warn!("push h264: {e}");
-                        } else {
+                        let t_push = std::time::Instant::now();
+                        match push_bounded(&host, nal, per_frame, keyframe).await {
+                            Err(e) => warn!("push h264: {e}"),
+                            Ok(true) => dropped_frames += 1,
+                            Ok(false) => {
                             frames_out += 1;
                             stage_capture += ms_capture;
-                            if rate_window.elapsed() >= Duration::from_secs(5) {
+                            stage_push += t_push.elapsed();
+if rate_window.elapsed() >= Duration::from_secs(5) {
                                 let window_frames = frames_out - rate_mark;
                                 let fps =
                                     window_frames as f64 / rate_window.elapsed().as_secs_f64();
-                                info!(
-                                    "streaming {fps:.1} fps ({frames_out} frames total, GPU-encoded on Windows) \
-                                     | per frame: relay {:.1}ms",
+                                let sent = window_frames + dropped_frames;
+                                let drop_pct = if sent > 0 { dropped_frames * 100 / sent } else { 0 };
+                                // The pre-encoded encoder is the only component the
+                                // link cannot throttle by itself. If sheds persist,
+                                // step the commanded target down so the player gets
+                                // every frame the link can carry.
+                                let decided =
+                                    link_gov.on_window(dropped_frames as u32, window_frames as u32);
+                                if decided != commanded_target {
+                                    commanded_target = decided;
+                                    capturer.set_target(decided.clone());
+                                    info!(
+                                        "link governor: commanded encoder {}x{}@{} ({} kbps) after {}% sheds",
+                                        decided.width, decided.height, decided.fps,
+                                        decided.bitrate_kbps, drop_pct
+                                    );
+                                }
+                                eprintln!(
+                                    "[couchlink-host] streaming {fps:.1} fps ({frames_out} frames total, GPU-encoded on Windows) \
+                                     | per frame: relay {:.1}ms | dropped {dropped_frames}/{sent} ({drop_pct}%) — {}",
+                                    if dropped_frames == 0 {
+                                        "link keeping up".to_string()
+                                    } else {
+                                        format!(
+                                            "bottleneck: peer/network can't consume at {:.0} Mbps",
+                                            preset.bitrate_kbps as f64 / 1000.0
+                                        )
+                                    },
                                     (stage_capture / window_frames.max(1) as u32).as_secs_f64()
                                         * 1000.0
                                 );
+                                let _ = signal_out.send(host_stats_message(
+                                    fps,
+                                    window_frames,
+                                    dropped_frames,
+                                    drop_pct as u32,
+                                    stage_capture,
+                                    stage_scale,
+                                    stage_encode,
+                                    stage_push,
+                                    &commanded_target,
+                                ));
                                 rate_window = std::time::Instant::now();
                                 rate_mark = frames_out;
                                 idle_frames = 0;
+                                dropped_frames = 0;
                                 stage_capture = Duration::ZERO;
+                                stage_scale = Duration::ZERO;
+                                stage_encode = Duration::ZERO;
+                                stage_push = Duration::ZERO;
+                            }
                             }
                         }
                         }
@@ -642,15 +788,16 @@ async fn main() -> Result<()> {
                         .elapsed()
                         .clamp(Duration::from_millis(1), Duration::from_millis(500));
                     last_push = std::time::Instant::now();
-                    if let Err(e) = push_bounded(
+                    match push_bounded(
                         &host,
                         nal.clone(),
                         real_gap,
                         couchlink_proto::annex_b_is_keyframe(&nal),
                     )
                     .await {
-                        warn!("push h264: {e}");
-                    } else {
+                        Err(e) => warn!("push h264: {e}"),
+                        Ok(true) => dropped_frames += 1,
+                        Ok(false) => {
                         frames_out += 1;
                         stage_capture += ms_capture;
                         stage_scale += ms_scale;
@@ -669,13 +816,40 @@ async fn main() -> Result<()> {
                                 0
                             };
                             let per = window_frames.max(1) as u32;
-                            info!(
-                                "streaming {fps:.1} fps ({frames_out} frames total, {idle_pct}% skipped as static)                                  | per frame: capture {:.1}ms scale {:.1}ms encode {:.1}ms push {:.1}ms",
+                            let sent = window_frames + dropped_frames;
+                            let drop_pct = if sent > 0 { dropped_frames * 100 / sent } else { 0 };
+                            let stages: [(&str, Duration); 4] = [
+                                ("capture", stage_capture / per),
+                                ("scale", stage_scale / per),
+                                ("encode", stage_encode / per),
+                                ("push", stage_push / per),
+                            ];
+                            eprintln!(
+                                "[couchlink-host] streaming {fps:.1} fps ({frames_out} frames total, {idle_pct}% skipped as static) \
+                                 | per frame: capture {:.1}ms scale {:.1}ms encode {:.1}ms push {:.1}ms \
+                                 | dropped {dropped_frames}/{sent} ({drop_pct}%) | bottleneck: {}",
                                 (stage_capture / per).as_secs_f64() * 1000.0,
                                 (stage_scale / per).as_secs_f64() * 1000.0,
                                 (stage_encode / per).as_secs_f64() * 1000.0,
                                 (stage_push / per).as_secs_f64() * 1000.0,
+                                dominant_stage(&stages),
                             );
+                            let _ = signal_out.send(host_stats_message(
+                                fps,
+                                window_frames,
+                                dropped_frames,
+                                drop_pct as u32,
+                                stage_capture,
+                                stage_scale,
+                                stage_encode,
+                                stage_push,
+                                &couchlink_capture_bridge::EncodeTarget {
+                                    width: preset.width,
+                                    height: preset.height,
+                                    fps: preset.fps,
+                                    bitrate_kbps: preset.bitrate_kbps,
+                                },
+                            ));
                             stage_capture = Duration::ZERO;
                             stage_scale = Duration::ZERO;
                             stage_encode = Duration::ZERO;
@@ -683,6 +857,8 @@ async fn main() -> Result<()> {
                             rate_window = std::time::Instant::now();
                             rate_mark = frames_out;
                             idle_frames = 0;
+                            dropped_frames = 0;
+                        }
                         }
                     }
                 }
@@ -718,5 +894,45 @@ fn stream_info_message(
         codec: "H264".into(),
         capture_ok,
         capture_hint,
+    }
+}
+
+/// Per-window host pipeline telemetry for the debug panel. `target_*` is the
+/// encoder target currently commanded (the governor's current rung), so the
+/// panel can show the host stepping down on a saturated link rather than
+/// silently starving.
+fn host_stats_message(
+    fps: f64,
+    frames_out: u64,
+    dropped_frames: u64,
+    drop_pct: u32,
+    capture: Duration,
+    scale: Duration,
+    encode: Duration,
+    push: Duration,
+    target: &couchlink_capture_bridge::EncodeTarget,
+) -> SignalMessage {
+    let per = frames_out.max(1) as u32;
+    let avg = |d: Duration| (d / per).as_secs_f64() * 1000.0;
+    let stages: [(&str, Duration); 4] = [
+        ("capture", capture / per),
+        ("scale", scale / per),
+        ("encode", encode / per),
+        ("push", push / per),
+    ];
+    SignalMessage::HostStats {
+        fps,
+        frames_out,
+        dropped_frames,
+        drop_pct,
+        capture_ms: avg(capture),
+        scale_ms: avg(scale),
+        encode_ms: avg(encode),
+        push_ms: avg(push),
+        dominant_stage: dominant_stage(&stages).into(),
+        target_width: target.width,
+        target_height: target.height,
+        target_fps: target.fps,
+        target_bitrate_kbps: target.bitrate_kbps,
     }
 }

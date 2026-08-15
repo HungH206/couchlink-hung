@@ -72,6 +72,16 @@ pub enum SignalMessage {
         #[serde(default)]
         id: String,
     },
+    /// Player reports which video path it is actually presenting from.
+    ///
+    /// The host otherwise writes every frame to both the RTP track and the
+    /// CLVD DataChannel, because it has no way to know which one the browser
+    /// paints — double the per-frame send work, and two streams competing
+    /// inside one congestion controller. `path` is `"webcodecs"` or `"rtp"`;
+    /// an unrecognised value is treated as unknown (send both).
+    PresentPath {
+        path: String,
+    },
     /// Host announces stream ready (codec / resolution).
     StreamInfo {
         width: u32,
@@ -83,6 +93,34 @@ pub enum SignalMessage {
         capture_ok: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capture_hint: Option<String>,
+    },
+    /// Host pipeline telemetry — where each frame's time goes on the host side.
+    ///
+    /// Sent every stats window (~5s) so the debug panel can name the slow hop
+    /// from the host's half of the path too: the browser already reports its
+    /// own decode/paint numbers, and these are the host's capture/scale/encode/
+    /// push averages for the same window.
+    HostStats {
+        /// Frames per second the host pushed to the wire in the last window.
+        fps: f64,
+        /// Frames pushed (sent) in the last window.
+        frames_out: u64,
+        /// Frames dropped or shed in the last window.
+        dropped_frames: u64,
+        /// Drop share in the last window (0-100).
+        drop_pct: u32,
+        /// Per-frame stage averages in the last window, milliseconds.
+        capture_ms: f64,
+        scale_ms: f64,
+        encode_ms: f64,
+        push_ms: f64,
+        /// Stage dominating host per-frame time in the last window.
+        dominant_stage: String,
+        /// What the encoder is currently commanded to produce.
+        target_width: u32,
+        target_height: u32,
+        target_fps: u32,
+        target_bitrate_kbps: u32,
     },
 }
 
@@ -146,5 +184,25 @@ impl SignalMessage {
 
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn present_path_round_trips() {
+        let m = SignalMessage::PresentPath {
+            path: "webcodecs".into(),
+        };
+        let s = m.to_json().unwrap();
+        assert!(s.contains("\"type\":\"present_path\""));
+        assert!(s.contains("\"path\":\"webcodecs\""));
+        let back = SignalMessage::from_json(&s).unwrap();
+        match back {
+            SignalMessage::PresentPath { path } => assert_eq!(path, "webcodecs"),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }

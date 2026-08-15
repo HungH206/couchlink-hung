@@ -5,6 +5,7 @@ mod keyboard_input;
 mod xbox_reader;
 mod config_file;
 mod invite;
+mod wireguard;
 mod prompt;
 mod reachability;
 mod signaling_client;
@@ -126,6 +127,7 @@ impl Args {
             if args.turn_pass.is_none() {
                 args.turn_pass = parsed.turn_pass.clone();
             }
+            raise_tunnel_if_offered(&parsed);
             if invite::is_headscale_invite(&parsed) {
                 info!(
                     "Headscale join link — use ./scripts/join-headscale.sh (or install.sh --online) then route via {}",
@@ -206,7 +208,12 @@ fn main() -> Result<()> {
             view::ViewResult::Closed => return Ok(()),
             view::ViewResult::Rejoin(url) => {
                 let _ = config_file::write_join_url(&url);
-                join_prefill = url;
+                // winit allows exactly one EventLoop per process, so looping
+                // back into run_windowed fails with "EventLoop can't be
+                // recreated" and silently drops to headless — which renders no
+                // video at all, so the user sees the app do nothing. Re-exec
+                // instead: a fresh process gets a fresh EventLoop.
+                return rejoin_via_reexec(&url);
             }
         }
     }
@@ -222,8 +229,52 @@ fn init_tracing() {
         .ok();
 }
 
+/// Raise the WireGuard tunnel the invite carries, if it carries one.
+///
+/// Never fatal. The invite already describes a working path (mesh address,
+/// TURN, or a public signaling URL), so a tunnel we cannot raise costs speed,
+/// not the session — and failing the join over it would be strictly worse than
+/// connecting the slow way.
+fn raise_tunnel_if_offered(parsed: &invite::ParsedInvite) {
+    let Some(conf) = parsed.wireguard_conf.as_deref() else {
+        return;
+    };
+    // Both invite-handling paths call this, and a --join-url run can hit both.
+    // Without the guard the user sees the status twice and wg-quick is invoked
+    // twice for one join.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let mut ran = false;
+    ONCE.call_once(|| ran = true);
+    if !ran {
+        return;
+    }
+    // eprintln, not tracing: the invite is resolved before the subscriber is
+    // installed (main initialises it further down), so info!/warn! here are
+    // dropped on the floor. This is the one message that says whether the
+    // direct tunnel came up — losing it silently defeats the whole feature.
+    match wireguard::ensure_up(conf) {
+        wireguard::TunnelState::Up => {
+            eprintln!("==> direct WireGuard tunnel up (handshake confirmed)");
+        }
+        wireguard::TunnelState::AlreadyUp => {
+            eprintln!("==> direct WireGuard tunnel already up");
+        }
+        wireguard::TunnelState::NoHandshake => {
+            eprintln!(
+                "==> direct tunnel did not handshake — the host endpoint is not reachable\n    from this network; continuing over {}",
+                parsed.signaling
+            );
+        }
+        wireguard::TunnelState::Unavailable(why) => {
+            eprintln!("==> direct tunnel unavailable ({why})");
+            eprintln!("    continuing over {}", parsed.signaling);
+        }
+    }
+}
+
 fn resolve_join_string(raw: &str, cli: &Args) -> Result<ResolvedArgs> {
     let parsed = invite::parse_join_input(raw)?;
+    raise_tunnel_if_offered(&parsed);
     if invite::is_headscale_invite(&parsed) {
         info!(
             "Headscale join link — use ./scripts/join-headscale.sh (or install.sh --online) then route via {}",
@@ -265,6 +316,28 @@ fn run_headless(args: ResolvedArgs) -> Result<()> {
 ///
 /// `join_prefill` seeds the waiting-screen field. `args` starts networking when
 /// present; otherwise the window waits until the user submits a join link.
+/// Restart this binary with the new join URL.
+///
+/// The alternative is recreating winit's EventLoop, which it forbids.
+fn rejoin_via_reexec(url: &str) -> Result<()> {
+    let exe = std::env::current_exe().context("locate current executable")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--join-url").arg(url);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec replaces this process, so there is no window of two clients
+        // fighting over the same pad device or audio output.
+        let err = cmd.exec();
+        return Err(err).context("re-exec for rejoin");
+    }
+    #[allow(unreachable_code)]
+    {
+        let status = cmd.status().context("re-exec for rejoin")?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
+}
+
 fn run_windowed(args: Option<ResolvedArgs>, join_prefill: String) -> Result<view::ViewResult> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -302,7 +375,11 @@ fn run_windowed(args: Option<ResolvedArgs>, join_prefill: String) -> Result<view
     let view_result = match view::run(frame_rx, keyboard_pad, shutdown_tx, join_prefill) {
         Ok(r) => r,
         Err(e) => {
-            warn!("windowed viewer failed ({e}), falling back to headless mode");
+            // Headless has no video output at all — say so rather than
+            // letting the user watch a silent process and conclude the whole
+            // thing is broken.
+            warn!("windowed viewer failed ({e})");
+            warn!("falling back to headless: input still works, but THERE WILL BE NO VIDEO WINDOW");
             if let Some(net_thread) = net_thread {
                 if let Err(join_err) = net_thread.join() {
                     warn!("network thread panicked during fallback shutdown: {join_err:?}");

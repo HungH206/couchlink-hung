@@ -1,4 +1,6 @@
 import { encodeClpd, fromBrowserGamepad, PAD_CHANNEL, type PadState } from "./clpd";
+import { KeyboardMouseInput } from "./keyboardMouse";
+import { TouchGamepadInput } from "./touchPad";
 import {
   ClvdAssembler,
   decodeClvdFragment,
@@ -21,7 +23,7 @@ export type ConnectionState =
   | "connected"
   | "error";
 
-export type PresentPath = "webcodecs" | "rtp";
+export type PresentPath = "webcodecs" | "rtp" | "warmup";
 
 export interface PlayerCallbacks {
   onState: (s: ConnectionState, detail?: string) => void;
@@ -38,12 +40,70 @@ export interface PlayerCallbacks {
     capture_ok?: boolean;
     capture_hint?: string;
   }) => void;
+  /** Host pipeline stage timings + commanded encoder target, ~5s tick. */
+  onHostStats?: (stats: {
+    fps: number;
+    frames_out: number;
+    dropped_frames: number;
+    drop_pct: number;
+    capture_ms: number;
+    scale_ms: number;
+    encode_ms: number;
+    push_ms: number;
+    dominant_stage: string;
+    target_width: number;
+    target_height: number;
+    target_fps: number;
+    target_bitrate_kbps: number;
+  }) => void;
   onPadStats?: (hz: number, name: string) => void;
+  /** Full getStats-derived telemetry snapshot, ~2s tick. */
+  onTelemetry?: (t: PlayerTelemetry) => void;
 }
+
+export type MediaPathStats = {
+  local: string;
+  remote: string;
+  family: "IPv4" | "IPv6";
+  protocol: string;
+  relayed: boolean;
+  rttMs: number;
+};
+
+export type InboundVideoStats = {
+  jitterBufferMs: number;
+  decodeFps: number;
+  framesDropped: number;
+  framesDecoded: number;
+  bitrateKbps: number;
+  bytesReceived: number;
+  packetsLost: number;
+  packetsReceived: number;
+  packetLossPct: number;
+  jitterMs: number;
+  frameWidth: number;
+  frameHeight: number;
+  framesPerSecond: number;
+  pauseCount: number;
+  freezeCount: number;
+  totalFreezesDuration: number;
+};
+
+export type PlayerTelemetry = {
+  path: MediaPathStats | null;
+  video: InboundVideoStats | null;
+  padHz: number;
+  padName: string;
+  at: number;
+};
 
 const SESSION_NOT_FOUND_RETRIES = 12;
 const SESSION_NOT_FOUND_DELAY_MS = 750;
-const MEDIA_RECOVER_DELAY_MS = 5000;
+/** How long to wait before triggering a peer reset when media was previously healthy.
+ *  TURN paths regularly bounce ICE failed→connected; give them time to self-heal. */
+const MEDIA_RECOVER_DELAY_MS = 12_000;
+/** Shorter delay when the peer was never healthy (first-connect failure). */
+const MEDIA_RECOVER_DELAY_COLD_MS = 5_000;
 /** 250Hz — matches the native client and keeps sampling off the display clock. */
 const PAD_POLL_MS = 4;
 
@@ -68,16 +128,29 @@ export class CouchlinkPlayer {
   private connectTimer: number | null = null;
   private sessionRetryTimer: number | null = null;
   private mediaRecoverTimer: number | null = null;
+  private iceDisconnectTimer: number | null = null;
   private sessionRetries = 0;
   private pending: { sid: string; pin: string } | null = null;
   private seq = 0;
   private padSent = 0;
   private padWindowStart = 0;
   private padName = "none";
+  /** Last 1s pad send-rate reported to the UI, reused in telemetry ticks. */
+  private lastPadHz = 0;
   /** Last Gamepad.id announced to the host, so pad_info is sent only on change. */
   private padInfoSent = "";
   /** Last logged media-path summary, so the line prints only on change. */
   private lastPathKey = "";
+  /** Keyboard+mouse input source — injected by the UI, null if not active. */
+  private kbm: KeyboardMouseInput | null = null;
+  /** Touch-screen controller — injected by the UI on mobile, null otherwise. */
+  private touch: TouchGamepadInput | null = null;
+  /** Previous inbound-rtp sample, for bitrate + loss deltas. */
+  private lastInbound:
+    | { bytes: number; lost: number; count: number; at: number }
+    | null = null;
+  /** Last present path reported to the host, so it is sent only on change. */
+  private presentPathSent: PresentPath | "" = "";
   private turn: { url: string; user: string; pass: string } | null = null;
   private gotVideoTrack = false;
   private lastOfferEpoch = 0;
@@ -92,6 +165,16 @@ export class CouchlinkPlayer {
 
   setTurn(turn: { url: string; user: string; pass: string } | null) {
     this.turn = turn;
+  }
+
+  /** Attach or detach a keyboard/mouse input source. Call with null to disable. */
+  setKbm(kbm: KeyboardMouseInput | null) {
+    this.kbm = kbm;
+  }
+
+  /** Attach or detach the mobile touch controller. Call with null to disable. */
+  setTouchInput(touch: TouchGamepadInput | null) {
+    this.touch = touch;
   }
 
   connect(signalingUrl: string, sessionId: string, pin: string) {
@@ -176,6 +259,24 @@ export class CouchlinkPlayer {
     this.cb.onState("disconnected");
   }
 
+  /**
+   * Report the present path to the UI, and to the host over signaling.
+   *
+   * Before this the host wrote every frame to RTP *and* the DataChannel,
+   * because it had no way to know which one the browser paints — double the
+   * per-frame send work, and two streams competing inside one congestion
+   * controller. Sent only on change, and only once the socket is open; a path
+   * decided before `register_player` completes is reported as soon as it can be.
+   */
+  private notifyPresentPath(path: PresentPath, detail?: string) {
+    this.cb.onPresentPath?.(path, detail);
+    if (this.presentPathSent === path) return;
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.presentPathSent = path;
+    send(this.ws, { type: "present_path", path });
+    clog("signal → present_path", path);
+  }
+
   private sendRegister(ws: WebSocket) {
     const p = this.pending;
     if (!p || ws.readyState !== WebSocket.OPEN) return;
@@ -199,7 +300,7 @@ export class CouchlinkPlayer {
    * Logged only when the pair or the rounded RTT changes, so it does not spam
    * a line every poll.
    */
-  private logSelectedPath(stats: RTCStatsReport) {
+  private logSelectedPath(stats: RTCStatsReport): MediaPathStats | null {
     let pair: any = null;
     const byId = new Map<string, any>();
     stats.forEach((r: any) => byId.set(r.id, r));
@@ -209,23 +310,95 @@ export class CouchlinkPlayer {
         if (!pair || r.nominated) pair = r;
       }
     });
-    if (!pair) return;
+    if (!pair) return null;
     const local = byId.get(pair.localCandidateId);
     const remote = byId.get(pair.remoteCandidateId);
     const rttMs = Math.round((pair.currentRoundTripTime ?? 0) * 1000);
     const relayed =
       local?.candidateType === "relay" || remote?.candidateType === "relay";
-    const key = `${local?.candidateType}/${remote?.candidateType}/${rttMs}`;
-    if (key === this.lastPathKey) return;
-    this.lastPathKey = key;
-    clog("media path", {
-      local: local?.candidateType,
-      remote: remote?.candidateType,
+    const result: MediaPathStats = {
+      local: local?.candidateType ?? "?",
+      remote: remote?.candidateType ?? "?",
       family: local?.address?.includes(":") ? "IPv6" : "IPv4",
-      protocol: local?.protocol,
+      protocol: local?.protocol ?? "?",
       relayed,
       rttMs,
+    };
+    const key = `${result.local}/${result.remote}/${rttMs}`;
+    if (key === this.lastPathKey) return result;
+    this.lastPathKey = key;
+    clog("media path", result);
+    return result;
+  }
+
+  private collectInbound(stats: RTCStatsReport): InboundVideoStats | null {
+    let r: any = null;
+    stats.forEach((s: any) => {
+      if (s.type === "inbound-rtp" && s.kind === "video") r = s;
     });
+    if (!r) return null;
+    const now = performance.now();
+    const prev = this.lastInbound;
+    const bytes = r.bytesReceived ?? 0;
+    const lost = r.packetsLost ?? 0;
+    const count = r.jitterBufferEmittedCount ?? 0;
+    const decoded = r.framesDecoded ?? 0;
+    const bitrateKbps = prev
+      ? Math.max(0, Math.round(((bytes - prev.bytes) * 8) / Math.max(1, now - prev.at)))
+      : 0;
+    const lostDelta = prev ? Math.max(0, lost - prev.lost) : 0;
+    const received = r.packetsReceived ?? 0;
+    const packetLossPct =
+      lostDelta + received > 0 ? (lostDelta / (lostDelta + received)) * 100 : 0;
+    this.lastInbound = { bytes, lost, count, at: now };
+
+    // jitterBufferMs / decodeFps need the delta over the polling window, so we
+    // can't derive them from the cumulative inbound-rtp row alone.
+    const prevStats = this.lastStats;
+    this.lastStats = { delay: r.jitterBufferDelay ?? 0, count, decoded };
+    let jitterBufferMs = 0;
+    let decodeFps = 0;
+    if (prev && prevStats && count > prevStats.count) {
+      const w = jitterWindow(
+        {
+          jitterBufferDelay: prevStats.delay,
+          jitterBufferEmittedCount: prevStats.count,
+          framesDecoded: prevStats.decoded,
+          framesDropped: 0,
+        },
+        {
+          jitterBufferDelay: r.jitterBufferDelay ?? 0,
+          jitterBufferEmittedCount: count,
+          framesDecoded: decoded,
+          framesDropped: r.framesDropped ?? 0,
+        },
+        (now - prev.at) / 1000
+      );
+      if (w) {
+        jitterBufferMs = w.jitterBufferMs;
+        decodeFps = w.decodeFps;
+      }
+    }
+    // Chrome will grow the JB after packet jitter; pin it back every poll.
+    this.pinJitterBuffer();
+    return {
+      jitterBufferMs,
+      decodeFps,
+      framesDropped: r.framesDropped ?? 0,
+      framesDecoded: decoded,
+      bitrateKbps,
+      bytesReceived: bytes,
+      packetsLost: r.packetsLost ?? 0,
+      packetsReceived: received,
+      packetLossPct,
+      jitterMs: (r.jitter ?? 0) * 1000,
+      frameWidth: r.frameWidth ?? 0,
+      frameHeight: r.frameHeight ?? 0,
+      framesPerSecond: r.framesPerSecond ?? 0,
+      pauseCount: r.pauseCount ?? 0,
+      freezeCount: r.freezeCount ?? 0,
+      totalFreezesDuration: r.totalFreezesDuration ?? 0,
+    };
   }
 
   /**
@@ -241,44 +414,27 @@ export class CouchlinkPlayer {
       if (!pc) return;
       try {
         const stats = await pc.getStats();
-        this.logSelectedPath(stats);
-        stats.forEach((r: any) => {
-          if (r.type !== "inbound-rtp" || r.kind !== "video") return;
-          const delay = r.jitterBufferDelay ?? 0;
-          const count = r.jitterBufferEmittedCount ?? 0;
-          const decoded = r.framesDecoded ?? 0;
-          const prev = this.lastStats;
-          this.lastStats = { delay, count, decoded };
-          if (!prev || count === prev.count) return;
-          const window = jitterWindow(
-            {
-              jitterBufferDelay: prev.delay,
-              jitterBufferEmittedCount: prev.count,
-              framesDecoded: prev.decoded,
-              framesDropped: 0,
-            },
-            {
-              jitterBufferDelay: delay,
-              jitterBufferEmittedCount: count,
-              framesDecoded: decoded,
-              framesDropped: r.framesDropped ?? 0,
-            },
-            2
-          );
-          if (!window) return;
-          // Chrome will grow the JB after packet jitter; pin it back every poll.
-          this.pinJitterBuffer();
+        const path = this.logSelectedPath(stats);
+        const video = this.collectInbound(stats);
+        this.cb.onTelemetry?.({
+          path,
+          video,
+          padHz: this.lastPadHz,
+          padName: this.padName,
+          at: performance.now(),
+        });
+        if (video && video.framesDecoded > 0) {
           clog("video stats", {
-            jitterBufferMs: Math.round(window.jitterBufferMs),
-            decodeFps: Math.round(window.decodeFps),
-            framesDropped: window.framesDropped,
-            frameHeight: r.frameHeight,
-            pauseCount: r.pauseCount,
-            freezeCount: r.freezeCount,
-            totalFreezesDuration: r.totalFreezesDuration,
+            jitterBufferMs: Math.round(video.jitterBufferMs),
+            decodeFps: Math.round(video.decodeFps),
+            framesDropped: video.framesDropped,
+            frameHeight: video.frameHeight,
+            pauseCount: video.pauseCount,
+            freezeCount: video.freezeCount,
+            totalFreezesDuration: video.totalFreezesDuration,
             jbTarget: this.videoReceiver?.jitterBufferTarget ?? null,
           });
-        });
+        }
       } catch (e) {
         cwarn("getStats failed", String(e));
       }
@@ -306,15 +462,18 @@ export class CouchlinkPlayer {
     if (this.connectTimer) clearTimeout(this.connectTimer);
     if (this.sessionRetryTimer) clearTimeout(this.sessionRetryTimer);
     if (this.mediaRecoverTimer) clearTimeout(this.mediaRecoverTimer);
+    if (this.iceDisconnectTimer) clearTimeout(this.iceDisconnectTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.statsTimer) clearInterval(this.statsTimer);
     if (this.padTimer) clearInterval(this.padTimer);
     this.connectTimer = null;
     this.sessionRetryTimer = null;
     this.mediaRecoverTimer = null;
+    this.iceDisconnectTimer = null;
     this.heartbeatTimer = null;
     this.statsTimer = null;
     this.lastStats = null;
+    this.lastInbound = null;
     this.padTimer = null;
     this.resetPeer();
     this.ws?.close();
@@ -325,6 +484,8 @@ export class CouchlinkPlayer {
   private resetPeer() {
     if (this.padTimer) clearInterval(this.padTimer);
     this.padTimer = null;
+    if (this.iceDisconnectTimer) clearTimeout(this.iceDisconnectTimer);
+    this.iceDisconnectTimer = null;
     this.padDc?.close();
     this.videoDc?.close();
     this.pc?.close();
@@ -355,7 +516,7 @@ export class CouchlinkPlayer {
         send(this.ws, { type: "request_offer" });
         this.cb.onState("waiting_host", "Recovering media…");
       }
-    }, MEDIA_RECOVER_DELAY_MS);
+    }, this.mediaHealthy ? MEDIA_RECOVER_DELAY_MS : MEDIA_RECOVER_DELAY_COLD_MS);
   }
 
   private async applyRemoteOffer(sdp: string, epoch: number) {
@@ -439,24 +600,64 @@ export class CouchlinkPlayer {
 
     pc.onconnectionstatechange = () => {
       clog("pc.connectionState", pc.connectionState);
-      if (pc.connectionState === "failed") {
-        cwarn("WebRTC connection failed — check ICE / firewall / WSL IP in signaling URL");
-        this.scheduleMediaRecover("connection failed");
-      } else if (pc.connectionState === "connected") {
+      if (pc.connectionState === "connected") {
+        // Authoritative healthy signal — both ICE and DTLS are up.
         this.mediaHealthy = this.gotVideoTrack;
         if (this.mediaRecoverTimer) {
           clearTimeout(this.mediaRecoverTimer);
           this.mediaRecoverTimer = null;
         }
+      } else if (pc.connectionState === "disconnected") {
+        // Transient loss — schedule a recover with the full grace period.
+        // If ICE self-heals the timer will be cancelled before it fires.
+        this.scheduleMediaRecover("connection disconnected");
+      } else if (pc.connectionState === "failed") {
+        cwarn("WebRTC connection failed — scheduling recover");
+        this.scheduleMediaRecover("connection failed");
       }
     };
     pc.oniceconnectionstatechange = () => {
       clog("pc.iceConnectionState", pc.iceConnectionState);
-      if (pc.iceConnectionState === "failed") {
-        cwarn("ICE problem", pc.iceConnectionState);
-        this.scheduleMediaRecover("ICE failed");
+      if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+        // ICE layer is up — mark healthy and cancel any pending recover timer.
+        // connectionState may lag behind iceConnectionState on some browsers.
+        this.mediaHealthy = this.gotVideoTrack;
+        if (this.mediaRecoverTimer) {
+          clog("ICE reconnected — cancelling media recover timer");
+          clearTimeout(this.mediaRecoverTimer);
+          this.mediaRecoverTimer = null;
+        }
       } else if (pc.iceConnectionState === "disconnected") {
         cwarn("ICE disconnected (may recover on its own)", pc.iceConnectionState);
+        // "disconnected" = browser's consent-freshness pings stopped being answered.
+        // A NAT rebind or brief drop on a live direct P2P path (srflx/srflx) does
+        // exactly this. restartIce() is far cheaper than waiting for `failed` to
+        // trigger a full signaling round-trip — try it after a 4s grace period.
+        if (!this.iceDisconnectTimer) {
+          this.iceDisconnectTimer = window.setTimeout(() => {
+            this.iceDisconnectTimer = null;
+            if (this.pc?.iceConnectionState !== "disconnected") return;
+            clog("ICE still disconnected after grace — restarting ICE");
+            try {
+              this.pc.restartIce();
+            } catch (e) {
+              cwarn("restartIce failed", String(e));
+            }
+          }, 4000);
+        }
+      } else if (pc.iceConnectionState === "failed") {
+        if (this.iceDisconnectTimer) {
+          clearTimeout(this.iceDisconnectTimer);
+          this.iceDisconnectTimer = null;
+        }
+        cwarn("ICE failed — scheduling recover", pc.iceConnectionState);
+        this.scheduleMediaRecover("ICE failed");
+      } else {
+        // connected / completed / closed — cancel any pending ICE restart timer
+        if (this.iceDisconnectTimer) {
+          clearTimeout(this.iceDisconnectTimer);
+          this.iceDisconnectTimer = null;
+        }
       }
     };
     pc.onicegatheringstatechange = () => {
@@ -509,11 +710,11 @@ export class CouchlinkPlayer {
       this.cb.onState("connected", "video track");
       // Always deliver the stream so the UI can fall back if WebCodecs never paints.
       if (this.webcodecsPath) {
-        clog("RTP track received — held for fallback (WebCodecs/CLVD preferred)");
+        clog("RTP track received — painted as safety net until WebCodecs paints");
         this.cb.onVideo(stream);
         return;
       }
-      this.cb.onPresentPath?.("rtp");
+      this.notifyPresentPath("rtp");
       this.cb.onVideo(stream);
     };
 
@@ -567,9 +768,15 @@ export class CouchlinkPlayer {
       });
       if (useWc) {
         this.webcodecsPath = true;
-        this.cb.onPresentPath?.(
-          "webcodecs",
-          "CLVD DataChannel + WebCodecs (no RTP jitter buffer)"
+        // Warm-up: tell the host to keep BOTH paths live. Announcing
+        // "webcodecs" now would make it cut RTP while this fresh DataChannel
+        // is still in SCTP slow-start — RTP stops, the keyframe stalls, the
+        // decoder never configures, and the 2.5s fallback lands the viewer on
+        // RTP-with-jitter-buffer for the rest of the session. Stay "warmup"
+        // (both paths) until the first frame actually paints, then promote.
+        this.notifyPresentPath(
+          "warmup",
+          "CLVD DataChannel + WebCodecs warming — RTP stays live as safety net"
         );
         this.cb.onState("connected", "webcodecs video");
         this.gotVideoTrack = true;
@@ -584,7 +791,7 @@ export class CouchlinkPlayer {
             hasDecoder: typeof VideoDecoder === "function",
           }
         );
-        this.cb.onPresentPath?.(
+        this.notifyPresentPath(
           "rtp",
           window.isSecureContext
             ? "WebCodecs missing"
@@ -620,7 +827,22 @@ export class CouchlinkPlayer {
   /** Stop preferring CLVD/WebCodecs — UI is switching to the RTP present path. */
   preferRtpPresent() {
     this.webcodecsPath = false;
-    this.cb.onPresentPath?.("rtp", "WebCodecs fallback");
+    this.notifyPresentPath("rtp", "WebCodecs fallback");
+  }
+
+  /**
+   * WebCodecs has painted its first frame — cut RTP and go DataChannel-only.
+   *
+   * Called by the App when the WebCodecs canvas reports its first paint, so
+   * the host stops writing the RTP track nobody is looking at. The pre-paint
+   * state is "warmup", which keeps both paths live as a safety net.
+   */
+  promoteWebcodecs() {
+    if (!this.webcodecsPath) return;
+    this.notifyPresentPath(
+      "webcodecs",
+      "CLVD DataChannel + WebCodecs (no RTP jitter buffer)"
+    );
   }
 
   /**
@@ -650,7 +872,58 @@ export class CouchlinkPlayer {
         break;
       }
     }
-    if (!gp) return;
+    if (!gp) {
+      // No gamepad — fall back to the touch controller (mobile), else
+      // keyboard/mouse.
+      const touch = this.touch;
+      if (touch) {
+        this.seq = (this.seq + 1) >>> 0;
+        const state = touch.sample(this.seq);
+        this.padDc.send(encodeClpd(state));
+        this.padSent += 1;
+        // Tell the host this is a touch controller so it picks a DualSense
+        // virtual pad (CLPD frames are DualSense-shaped, same as kbm/pad).
+        if (this.padInfoSent !== "touch") {
+          this.padInfoSent = "touch";
+          if (this.ws?.readyState === WebSocket.OPEN) {
+            send(this.ws, { type: "pad_info", kind: "dualsense", id: "touch" });
+          }
+        }
+        this.padName = "touch";
+        const now = performance.now();
+        if (now - this.padWindowStart >= 1000) {
+          this.lastPadHz = this.padSent;
+          this.cb.onPadStats?.(this.padSent, "touch");
+          this.padSent = 0;
+          this.padWindowStart = now;
+        }
+        return;
+      }
+      // No gamepad — fall back to keyboard/mouse if active
+      const kbm = this.kbm;
+      if (!kbm) return;
+      this.seq = (this.seq + 1) >>> 0;
+      const kbmState = kbm.sample(this.seq);
+      this.padDc.send(encodeClpd(kbmState));
+      this.padSent += 1;
+      // Tell the host this is keyboard+mouse so it picks a DualSense virtual pad
+      // (CLPD frames from kbm are DualSense-shaped, same as a real pad).
+      if (this.padInfoSent !== "keyboard") {
+        this.padInfoSent = "keyboard";
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          send(this.ws, { type: "pad_info", kind: "dualsense", id: "keyboard+mouse" });
+        }
+      }
+      this.padName = "keyboard+mouse";
+      const now = performance.now();
+      if (now - this.padWindowStart >= 1000) {
+        this.lastPadHz = this.padSent;
+        this.cb.onPadStats?.(this.padSent, "keyboard+mouse");
+        this.padSent = 0;
+        this.padWindowStart = now;
+      }
+      return;
+    }
     // Tell the host which pad family this is. PadFrame is normalised by the
     // Gamepad API, so the host cannot infer it from input — without this it
     // binds the emulator to whatever was configured last, which drops every
@@ -670,6 +943,7 @@ export class CouchlinkPlayer {
     this.padSent += 1;
     const now = performance.now();
     if (now - this.padWindowStart >= 1000) {
+      this.lastPadHz = this.padSent;
       this.cb.onPadStats?.(this.padSent, this.padName);
       this.padSent = 0;
       this.padWindowStart = now;
@@ -735,6 +1009,9 @@ export class CouchlinkPlayer {
       case "stream_info":
         clog("stream_info", msg);
         this.cb.onStreamInfo?.(msg);
+        break;
+      case "host_stats":
+        this.cb.onHostStats?.(msg);
         break;
       case "peer_left":
         this.cb.onState("waiting_host", "Host disconnected");

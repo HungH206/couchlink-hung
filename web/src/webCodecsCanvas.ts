@@ -24,6 +24,34 @@ export function canUseWebCodecs(): boolean {
   );
 }
 
+/**
+ * Label the likely bottleneck from the numbers this decoder can actually see.
+ *
+ * Deliberately coarse — this is a first triage step, not a diagnosis. `dropped`
+ * counts frames this decoder discarded (stale/out of order), which on this
+ * unordered channel is the client-visible symptom of a packet loss or a host
+ * stall; it cannot tell those two apart from here, hence "consider" rather
+ * than a firm verdict.
+ */
+export function webcodecsDiagnosis(
+  presentFps: number,
+  decodeMsAvg: number,
+  dropped: number
+): string {
+  // A 60fps stream gives ~16.7ms per frame; decode competing with paint and
+  // compositing eating half that budget is a real local bottleneck, not noise.
+  if (decodeMsAvg > 8) {
+    return `decode-bound (${decodeMsAvg.toFixed(1)}ms/frame on this device)`;
+  }
+  if (dropped > 0 && presentFps < 45) {
+    return "frames arriving incomplete — possible network loss (host: try COUCHLINK_FEC=1)";
+  }
+  if (presentFps < 45) {
+    return "low frame rate with fast local decode — host or network side, not this device";
+  }
+  return "healthy";
+}
+
 export type WebCodecsStats = {
   mode: "webcodecs";
   presentFps: number;
@@ -51,6 +79,7 @@ export class WebCodecsCanvasView {
   private lastH = 0;
   private onStats: ((s: WebCodecsStats) => void) | null = null;
   private onNeedKeyframe: (() => void) | null = null;
+  private onFirstPaint: (() => void) | null = null;
   private lastPli = 0;
   private description: Uint8Array | null = null;
   private codec = "avc1.4D0028";
@@ -64,6 +93,11 @@ export class WebCodecsCanvasView {
 
   setKeyframeHandler(cb: (() => void) | null) {
     this.onNeedKeyframe = cb;
+  }
+
+  /** Fired once, the first time a decoded frame is painted on screen. */
+  setFirstPaintHandler(cb: (() => void) | null) {
+    this.onFirstPaint = cb;
   }
 
   /** True once at least one frame has been painted. */
@@ -201,10 +235,12 @@ export class WebCodecsCanvasView {
       }
 
       if (dec.decodeQueueSize > 2) {
-        // Prefer newest over catch-up — drop this AU; keep decoder configured.
+        // Decoder is backed up locally (slow paint/GPU, not a network issue).
+        // Drop the frame to let it catch up, but do NOT set waitingKeyframe —
+        // the decoder is still configured and the last keyframe is still valid.
+        // Requesting an IDR here just floods the host with PLIs and makes the
+        // stream degenerate into keyframe-only mode.
         this.dropped += 1;
-        this.waitingKeyframe = true;
-        this.requestKeyframe();
         return;
       }
 
@@ -250,18 +286,36 @@ export class WebCodecsCanvasView {
     ctx.drawImage(frame, 0, 0);
     this.painted += 1;
     this.paintedTotal += 1;
+    if (this.paintedTotal === 1) {
+      this.onFirstPaint?.();
+    }
 
     const now = performance.now();
     if (now - this.windowStart >= 1000) {
       const elapsed = (now - this.windowStart) / 1000;
       const n = Math.max(this.painted, 1);
-      this.onStats?.({
-        mode: "webcodecs",
-        presentFps: Math.round(this.painted / elapsed),
+      const presentFps = Math.round(this.painted / elapsed);
+      const decodeMs = this.decodeMsAccum / n;
+      // This is the real path for Chrome: WebCodecs + CLVD paints directly,
+      // bypassing the RTP jitter buffer entirely. Every latency number logged
+      // elsewhere tonight came from getStats() on the RTP receiver — a shadow
+      // stream nobody was watching. This is the first one taken from the
+      // pipeline actually on screen.
+      clog("webcodecs stats", {
+        presentFps,
+        decodeMsAvg: Math.round(decodeMs * 10) / 10,
         dropped: this.dropped,
         width: this.lastW,
         height: this.lastH,
-        decodeMs: this.decodeMsAccum / n,
+        diagnosis: webcodecsDiagnosis(presentFps, decodeMs, this.dropped),
+      });
+      this.onStats?.({
+        mode: "webcodecs",
+        presentFps,
+        dropped: this.dropped,
+        width: this.lastW,
+        height: this.lastH,
+        decodeMs,
       });
       this.painted = 0;
       this.dropped = 0;
